@@ -13,6 +13,19 @@
  * have a look into http-anon.c to get more information.
  */
 
+/*
+ * 2024-05-14: Modified HttpStateData::haveParsedReplyHeaders() so that when
+ *             USE_HTTP_VIOLATIONS is enabled, private content that has been
+ *             cached due to the use of "ignore-private" can actually be
+ *             served up (following staleness rules). This is intended
+ *             to be used in situations where many [nearly identical] systems
+ *             will be retrieving the same assets nearly simultaneously, but
+ *             the "Cache-Control: private" header has been set unnecessarily.
+ *             In this usage context, there should be no concept of private
+ *             user data; the proxy should NOT be used with this modification
+ *             in situations where private user data may be processed.
+ */
+
 #include "squid.h"
 #include "acl/FilledChecklist.h"
 #include "base/AsyncJobCalls.h"
@@ -1038,10 +1051,25 @@ HttpStateData::haveParsedReplyHeaders()
             // CC:private (yes, these can sometimes be stored)
             const bool ccPrivate = rep->cache_control->hasPrivate();
 
+#if USE_HTTP_VIOLATIONS
+            // When using "ignore-private" we allow the cached results to be served up,
+            // "security be damned", because we won't be using the proxy in a per-user manner;
+            // Instead we'll only be using the proxy to consolidate many redundant simultaneous requests
+            // from nearly identical "worker machines" that should never have private individual data
+            // (or if they do, it should be identical amongst all of the "worker machines").
+            // In these cases, while we DON'T want to force revalidation every time,
+            // we DO want to force revalidation for stale assets, so that we are respecting time-based
+            // cache deletion requirements imposed by some server license agreements (e.g. Google).
+            if (ccNoCacheNoParams)
+                EBIT_SET(entry->flags, ENTRY_REVALIDATE_ALWAYS);
+            else if (ccMustRevalidate || ccSMaxAge || ccPrivate)
+                EBIT_SET(entry->flags, ENTRY_REVALIDATE_STALE);
+#else
             if (ccNoCacheNoParams || ccPrivate)
                 EBIT_SET(entry->flags, ENTRY_REVALIDATE_ALWAYS);
             else if (ccMustRevalidate || ccSMaxAge)
                 EBIT_SET(entry->flags, ENTRY_REVALIDATE_STALE);
+#endif // USE_HTTP_VIOLATIONS
         }
 #if USE_HTTP_VIOLATIONS // response header Pragma::no-cache is undefined in HTTP
         else {
